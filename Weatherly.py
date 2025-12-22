@@ -9,7 +9,7 @@ import database  # local module, make sure database.py is in same folder
 import sqlite3
 
 # ---------- CONFIG ----------
-API_KEY = "eac408cbe256621670200c5d87db8ac4"
+API_KEY = "YOUR API KEY HERE"
 WEATHER_URL = "https://api.openweathermap.org/data/2.5/weather"
 FORECAST_URL = "https://api.openweathermap.org/data/2.5/forecast"
 
@@ -296,8 +296,6 @@ class WelcomeScreen(ctk.CTkFrame):
         self.pack_forget()
         self.app.current_user = uname
         self.app.show_main_for_user()
-
-
 
 # ------------------ Login / Register Screens ------------------
 
@@ -1370,3 +1368,4 @@ class SettingsScreen(ctk.CTkFrame):
 if __name__ == "__main__":
     app = WeatherApp()
     app.mainloop()
+
