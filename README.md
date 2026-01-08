@@ -67,6 +67,9 @@ Search history is saved in the database
 Admin users can view logs and user activity
 
 # 🧑‍💻 Setup Instructions
+
+Admin Login: admin, password: admin123
+
 1️⃣ Clone the repository
 git clone https://github.com/chubbymaxwell41-commits/Weather-app-Weatherly.git
 
