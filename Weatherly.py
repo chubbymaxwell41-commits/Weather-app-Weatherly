@@ -1,24 +1,18 @@
 # Weatherly.py
 """
-Complete Weatherly application file (ready to copy/paste).
-
-Features included:
-- Welcome / Login / Register screens
-- Admin dashboard (view/delete users, view logs)
-- Main weather UI with search, favorites, recents
-- Debounced autocomplete suggestions (local recents + favorites, plus background OpenWeather geocoding)
-- Autocomplete does NOT steal focus; typing is not interrupted
-- Search happens only when user clicks Search, presses Enter, or selects a suggestion
-- Non-blocking network requests (threaded) and indeterminate progress bar while loading
-- Settings screen (temperature unit, dynamic background) with "Settings saved" toast
-- Robust image loading fallbacks and wind unit handling
-- Uses local database.py for persistence (ensure database.py is present)
+Weatherly - polished version with:
+- CTk-styled autocomplete popup (no native Listbox)
+- Favorite toggle feedback (toast + brief color pulse)
+- Startup toast when cached weather is loaded
+- requirements/.env/README support (see repo files)
+- Existing cached startup + session + search cache optimizations retained
 """
 
 import os
 import threading
 import time
 import hashlib
+import json
 from datetime import datetime
 from typing import List, Tuple, Dict, Any, Optional
 
@@ -36,17 +30,20 @@ API_KEY = os.getenv("OWM_API_KEY", "YOUR_API_KEY_HERE")
 WEATHER_URL = "https://api.openweathermap.org/data/2.5/weather"
 FORECAST_URL = "https://api.openweathermap.org/data/2.5/forecast"
 GEOCODE_URL = "http://api.openweathermap.org/geo/1.0/direct"
+IP_GEO_URL = "http://ip-api.com/json"
 
-ICON_DIR = "icons"  # keep your existing icon files here
-GEOCODE_CACHE_TTL = 300  # seconds (5 minutes)
-SEARCH_DEBOUNCE_MS = 600  # debounce delay for suggestion fetch in milliseconds
-MIN_AUTOSUGGEST_CHARS = 3  # only fetch geocode suggestions for queries >= this
+ICON_DIR = "icons"
+GEOCODE_CACHE_TTL = 300
+SEARCH_DEBOUNCE_MS = 450
+MIN_AUTOSUGGEST_CHARS = 3
+SEARCH_CACHE_TTL = 300
+LAST_WEATHER_FILE = "last_weather.json"
+AUTO_DETECT_CONFIG = "autodetect.json"
 # -----------------------------
 
-# initialize database (creates tables if necessary)
+# initialize DB
 database.init_db()
 
-# CTk appearance
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
@@ -56,7 +53,6 @@ def hash_pw(password: str) -> str:
 
 
 def load_icon(name: str, size=(64, 64)) -> Optional[ImageTk.PhotoImage]:
-    """Load an icon from ICON_DIR with safe fallback to None."""
     path = os.path.join(ICON_DIR, name)
     try:
         img = Image.open(path).convert("RGBA")
@@ -84,16 +80,54 @@ def map_weather_to_icon(weather_main: str, weather_id=None) -> str:
 def background_for_weather(main: str) -> str:
     m = (main or "").lower()
     if m == "clear":
-        return "#1E90FF"  # blue
+        return "#1E90FF"
     if m in ("clouds",):
-        return "#6c7680"  # grey
+        return "#6c7680"
     if m in ("rain", "drizzle"):
-        return "#2b3a4a"  # dark blue
+        return "#2b3a4a"
     if m in ("thunderstorm",):
-        return "#1b2430"  # very dark
+        return "#1b2430"
     if m == "snow":
-        return "#9aa6b2"  # light grey
-    return "#1f2630"  # default
+        return "#9aa6b2"
+    return "#1f2630"
+
+
+def load_autodetect_setting() -> bool:
+    try:
+        if os.path.exists(AUTO_DETECT_CONFIG):
+            with open(AUTO_DETECT_CONFIG, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return bool(data.get("auto_detect", True))
+    except Exception:
+        pass
+    return True
+
+
+def save_autodetect_setting(val: bool):
+    try:
+        with open(AUTO_DETECT_CONFIG, "w", encoding="utf-8") as f:
+            json.dump({"auto_detect": bool(val)}, f)
+    except Exception:
+        pass
+
+
+def load_last_weather() -> Optional[Dict[str, Any]]:
+    try:
+        if os.path.exists(LAST_WEATHER_FILE):
+            with open(LAST_WEATHER_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return None
+
+
+def save_last_weather(current: Dict[str, Any], forecast: Dict[str, Any]):
+    try:
+        payload = {"timestamp": time.time(), "current": current, "forecast": forecast}
+        with open(LAST_WEATHER_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+    except Exception:
+        pass
 
 
 # ------------------ Welcome Screen ------------------
@@ -104,7 +138,6 @@ class WelcomeScreen(ctk.CTkFrame):
         self.app = app
         self.configure(fg_color="#111111")
 
-        # Left artwork
         left = ctk.CTkFrame(self, width=400, corner_radius=20, fg_color="#1f2630")
         left.pack(side="left", fill="both", expand=True, padx=20, pady=20)
         try:
@@ -116,7 +149,6 @@ class WelcomeScreen(ctk.CTkFrame):
             art_label = ctk.CTkLabel(left, text="Weatherly", font=("Arial", 20, "bold"))
         art_label.place(relx=0.5, rely=0.5, anchor="center")
 
-        # Right container (login/register flows)
         self.right = ctk.CTkFrame(self, width=400, corner_radius=20, fg_color="#111111")
         self.right.pack(side="right", fill="y", padx=20, pady=20)
         self.right.pack_propagate(False)
@@ -362,31 +394,39 @@ class WeatherApp(ctk.CTk):
         self.container = ctk.CTkFrame(self, corner_radius=0)
         self.container.pack(fill="both", expand=True, padx=12, pady=12)
 
-        # app state
+        # state
         self.icon_cache: Dict[str, Any] = {}
         self.current_user = None
         self.settings = database.get_settings()
         self.temp_unit = self.settings["unit"]
         self.dynamic_bg = self.settings["dynamic_bg"]
 
+        # session & caches
+        self.session = requests.Session()
         self.is_loading = False
         self._search_debounce_job = None
-        self._suggest_win: Optional[tk.Toplevel] = None
-        self._suggest_listbox: Optional[tk.Listbox] = None
-        self._geocode_cache: Dict[str, Tuple[float, List[str]]] = {}  # q->(ts, results)
+        self._suggest_win: Optional[ctk.CTkToplevel] = None
+        self._suggest_buttons: List[ctk.CTkButton] = []
+        self._geocode_cache: Dict[str, Tuple[float, List[str]]] = {}
+        self._search_cache: Dict[str, Tuple[float, Dict[str, Any], Dict[str, Any]]] = {}
 
-        # show welcome (first screen)
+        # autodetect flags
+        self.auto_detect_enabled = load_autodetect_setting()
+        self._did_auto_detect = False
+        self._user_searched = False
+
+        # welcome
         self.welcome = WelcomeScreen(self.container, self)
         self.welcome.pack(fill="both", expand=True)
 
-        # placeholders
+        # frames
         self.login_frame = None
         self.settings_frame = None
         self.main_frame = None
         self.admin_frame = None
         self.register_frame = None
 
-    # --------------- screen flow helpers ----------------
+    # screens...
     def show_login(self):
         try:
             self.welcome.pack_forget()
@@ -427,6 +467,7 @@ class WeatherApp(ctk.CTk):
             self.login_frame.pack_forget()
         self.geometry("1200x720")
         self.build_main_ui()
+        self.after(100, self._maybe_auto_detect_location)
 
     def show_admin_dashboard(self):
         if self.login_frame:
@@ -436,7 +477,7 @@ class WeatherApp(ctk.CTk):
             self.admin_frame = AdminDashboard(self.container, app=self)
         self.admin_frame.pack(fill="both", expand=True, padx=12, pady=12)
 
-    # ---------------- Build main UI ----------------
+    # build UI (kept mostly same)
     def build_main_ui(self):
         try:
             if self.main_frame:
@@ -447,7 +488,7 @@ class WeatherApp(ctk.CTk):
         self.main_frame = ctk.CTkFrame(self.container, corner_radius=0)
         self.main_frame.pack(fill="both", expand=True)
 
-        # left sidebar
+        # sidebar
         sidebar = ctk.CTkFrame(self.main_frame, width=90, corner_radius=12)
         sidebar.pack(side="left", fill="y", padx=(0, 12), pady=0)
         logo = ctk.CTkLabel(sidebar, text="🌬", font=("Arial", 20))
@@ -458,16 +499,17 @@ class WeatherApp(ctk.CTk):
             else:
                 btn = ctk.CTkButton(sidebar, text=name, width=80, corner_radius=12, command=self.show_weather)
             btn.pack(pady=8)
+        # NEW: Globe button could be here later
 
         logout_btn = ctk.CTkButton(sidebar, text="Logout", width=80, corner_radius=12, fg_color="#b91c1c",
                                    hover_color="#7f1d1d", command=self.logout_user)
         logout_btn.pack(pady=20)
 
-        # center area
+        # center
         self.center = ctk.CTkFrame(self.main_frame, corner_radius=12)
         self.center.pack(side="left", fill="both", expand=True, padx=(0, 12), pady=0)
 
-        # search bar row
+        # search row
         search_row = ctk.CTkFrame(self.center, corner_radius=8)
         search_row.pack(fill="x", pady=(12, 6), padx=12)
 
@@ -478,19 +520,20 @@ class WeatherApp(ctk.CTk):
         self.search_entry.bind("<Down>", self._on_search_down_pressed)
         self.search_entry.pack(side="left", padx=(8, 6), pady=8)
 
-        self.search_btn = ctk.CTkButton(search_row, text="Search", width=90, command=self.search_and_update)
+        self.search_btn = ctk.CTkButton(search_row, text="Search", width=90, command=self._user_search_and_update)
         self.search_btn.pack(side="left", padx=(6, 6), pady=8)
 
-        # indeterminate progress bar (hidden by default)
         self.loading_bar = ctk.CTkProgressBar(search_row, orientation="horizontal", mode="indeterminate", width=120)
         self.loading_bar.pack_forget()
 
-        fav_btn = ctk.CTkButton(search_row, text="★", width=40, command=self.open_favorites_window)
+        fav_btn = ctk.CTkButton(search_row, text="★", width=40, command=self.toggle_favorite)
         fav_btn.pack(side="right", padx=(4, 6), pady=8)
         recent_btn = ctk.CTkButton(search_row, text="🕒", width=40, command=self.open_recents_window)
         recent_btn.pack(side="right", padx=(6, 4), pady=8)
+        # keep reference to favorite button
+        self.favorite_btn = fav_btn
 
-        # top info / main weather area
+        # top info
         top_info = ctk.CTkFrame(self.center, corner_radius=12)
         top_info.pack(fill="x", padx=12, pady=(6, 12))
 
@@ -503,21 +546,18 @@ class WeatherApp(ctk.CTk):
         self.city_label = ctk.CTkLabel(city_row, text="Welcome", font=("Arial", 26, "bold"))
         self.city_label.pack(side="left")
 
-        self.favorite_btn = ctk.CTkButton(city_row, text="☆", width=40, height=34, corner_radius=8, command=self.toggle_favorite)
-        self.favorite_btn.pack(side="left", padx=(12, 0))
-
+        # chance label / temp label / icon
         self.chance_label = ctk.CTkLabel(left_top, text="Chance of rain: --", font=("Arial", 12))
         self.chance_label.pack(anchor="w", padx=12, pady=(6, 6))
-
         self.temp_label = ctk.CTkLabel(left_top, text="--°", font=("Arial", 56, "bold"))
         self.temp_label.pack(anchor="w", padx=12, pady=(6, 12))
 
         right_top = ctk.CTkFrame(top_info, width=220, corner_radius=8)
         right_top.pack(side="right", padx=(6, 8), pady=10)
-
         self.big_icon_label = ctk.CTkLabel(right_top, text="", font=("Arial", 14))
         self.big_icon_label.pack(padx=10, pady=10)
 
+        # hourly / lower / right col
         hourly_frame = ctk.CTkFrame(self.center, corner_radius=12)
         hourly_frame.pack(fill="x", padx=12, pady=(6, 12))
         self.hourly_container = hourly_frame
@@ -532,16 +572,13 @@ class WeatherApp(ctk.CTk):
         self.info_uv = ctk.CTkLabel(lower_frame, text="UV Index: --", font=("Arial", 14))
         self.info_uv.pack(anchor="w", padx=12, pady=6)
 
-        # right column forecast
+        # right col
         self.right_col = ctk.CTkFrame(self.main_frame, width=320, corner_radius=12)
         self.right_col.pack(side="right", fill="y", padx=(12, 0), pady=0)
-
         heading = ctk.CTkLabel(self.right_col, text="5-DAY FORECAST", font=("Arial", 14, "bold"))
         heading.pack(pady=(12, 6))
-
         self.days_container = ctk.CTkScrollableFrame(self.right_col, corner_radius=8)
         self.days_container.pack(fill="both", expand=True, padx=10, pady=8)
-
         self.days_widgets = []
         for i in range(5):
             frame = ctk.CTkFrame(self.days_container, corner_radius=8, height=60)
@@ -557,14 +594,35 @@ class WeatherApp(ctk.CTk):
         self.error_label = ctk.CTkLabel(self.center, text="", text_color="#ff4d4d", font=("Arial", 12))
         self.error_label.pack(anchor="w", padx=20, pady=(0, 6))
 
-    # ---------------- Autocomplete & Debounce ----------------
+        # load cached UI immediately if available
+        last = load_last_weather()
+        if last and isinstance(last, dict):
+            try:
+                current = last.get("current")
+                forecast = last.get("forecast", {"list": []})
+                if current:
+                    self.update_ui_with_data(current, forecast)
+                    # feedback to user
+                    self.show_toast("Loaded cached weather", duration=1100)
+                    # refresh in background
+                    city_name = current.get("name")
+                    if city_name:
+                        threading.Thread(target=lambda: self._fetch_weather_thread(city_name), daemon=True).start()
+            except Exception:
+                pass
+
+    # user search wrapper
+    def _user_search_and_update(self):
+        self._user_searched = True
+        self.search_and_update()
+
+    # ---------------- Autocomplete (CTk popup) ----------------
     def _on_search_keyrelease(self, event):
         text = self.search_var.get().strip()
         if text:
             self._show_suggestions_local(text)
         else:
             self._hide_suggestions()
-        # debounce schedule: only used to fetch/merge suggestions, not to auto-search
         try:
             if self._search_debounce_job:
                 self.after_cancel(self._search_debounce_job)
@@ -573,10 +631,6 @@ class WeatherApp(ctk.CTk):
         self._search_debounce_job = self.after(SEARCH_DEBOUNCE_MS, lambda: self._debounce_fetch_suggestions(text))
 
     def _debounce_fetch_suggestions(self, text: str):
-        """
-        After debounce, fetch geocode suggestions (in background) if useful.
-        This does not trigger a search and does not disable the entry, so typing will not be interrupted.
-        """
         try:
             current = self.search_var.get().strip()
             if current == text and current:
@@ -592,6 +646,7 @@ class WeatherApp(ctk.CTk):
                 self._search_debounce_job = None
         except Exception:
             pass
+        self._user_searched = True
         self._hide_suggestions()
         self.search_and_update()
 
@@ -626,46 +681,60 @@ class WeatherApp(ctk.CTk):
         matches = [c for c in candidates if c.lower().startswith(ql)]
         if not matches:
             matches = [c for c in candidates if ql in c.lower()]
-        self._show_suggestions(matches)
+        # show via CTk popup
+        self._show_ctk_suggestions(matches)
         if len(query) >= MIN_AUTOSUGGEST_CHARS:
             self._schedule_geocode_fetch(query)
 
-    def _show_suggestions(self, items: List[str]):
+    def _show_ctk_suggestions(self, items: List[str]):
+        # hide if none
         if not items:
             self._hide_suggestions()
             return
-        if self._suggest_win and tk.Toplevel.winfo_exists(self._suggest_win):
-            lb = self._suggest_listbox
-            lb.delete(0, tk.END)
+        # if popup exists, refresh content
+        if self._suggest_win and getattr(self._suggest_win, "winfo_exists", lambda: False)():
+            # clear existing
+            for w in self._suggest_win.winfo_children():
+                w.destroy()
+            container = ctk.CTkScrollableFrame(self._suggest_win, fg_color="#2b2b2b")
+            container.pack(fill="both", expand=True)
         else:
-            self._suggest_win = tk.Toplevel(self)
+            # create CTkToplevel but don't force focus
+            self._suggest_win = ctk.CTkToplevel(self)
             self._suggest_win.overrideredirect(True)
             self._suggest_win.attributes("-topmost", True)
-            frame = tk.Frame(self._suggest_win, bg="#2b2b2b")
-            frame.pack(fill="both", expand=True)
-            lb = tk.Listbox(frame, bg="#2b2b2b", fg="#ffffff", highlightthickness=0, bd=0, activestyle="none")
-            lb.pack(side="left", fill="both", expand=True)
-            sb = tk.Scrollbar(frame, command=lb.yview)
-            sb.pack(side="right", fill="y")
-            lb.config(yscrollcommand=sb.set)
-            lb.bind("<Double-Button-1>", lambda e: self._apply_selected_suggestion_and_search())
-            lb.bind("<Return>", lambda e: self._apply_selected_suggestion_and_search())
-            lb.bind("<Escape>", lambda e: self._hide_suggestions())
-            self._suggest_listbox = lb
-        for m in items:
+            container = ctk.CTkScrollableFrame(self._suggest_win, fg_color="#2b2b2b")
+            container.pack(fill="both", expand=True)
+            # clicking outside should close - bind focus out
             try:
-                self._suggest_listbox.insert(tk.END, m)
+                self._suggest_win.bind("<FocusOut>", lambda e: self._hide_suggestions())
             except Exception:
                 pass
+        # create buttons for items
+        self._suggest_buttons = []
+        for it in items:
+            try:
+                b = ctk.CTkButton(container, text=it, fg_color="#2b2b2b", hover_color="#333333", anchor="w", command=lambda v=it: self._on_suggestion_click(v))
+                b.pack(fill="x", padx=6, pady=4)
+                self._suggest_buttons.append(b)
+            except Exception:
+                pass
+        # position under entry
         try:
             self.update_idletasks()
             x = self.search_entry.winfo_rootx()
             y = self.search_entry.winfo_rooty() + self.search_entry.winfo_height()
             width = self.search_entry.winfo_width() + (self.search_btn.winfo_width() if hasattr(self, "search_btn") else 0) + 10
             self._suggest_win.geometry(f"{width}x150+{x}+{y}")
-            # Do NOT force focus onto the popup — keep typing uninterrupted
+            # do not force focus so typing is uninterrupted
         except Exception:
             pass
+
+    def _on_suggestion_click(self, val: str):
+        self.search_var.set(val)
+        self._hide_suggestions()
+        self._user_searched = True
+        self.search_and_update()
 
     def _hide_suggestions(self):
         try:
@@ -674,37 +743,20 @@ class WeatherApp(ctk.CTk):
         except Exception:
             pass
         self._suggest_win = None
-        self._suggest_listbox = None
-
-    def _apply_selected_suggestion_and_search(self):
-        try:
-            lb = self._suggest_listbox
-            if not lb:
-                return
-            sel = lb.curselection()
-            if not sel:
-                return
-            val = lb.get(sel[0])
-            self.search_var.set(val)
-            self._hide_suggestions()
-            self.search_and_update()
-        except Exception:
-            pass
+        self._suggest_buttons = []
 
     def _on_search_down_pressed(self, event):
-        # Move focus into suggestion list without stealing focus initially
-        if self._suggest_listbox and self._suggest_listbox.size() > 0:
+        # focus first suggestion button if present
+        if self._suggest_buttons and len(self._suggest_buttons) > 0:
             try:
-                self._suggest_listbox.focus_set()
-                self._suggest_listbox.selection_clear(0, tk.END)
-                self._suggest_listbox.selection_set(0)
-                self._suggest_listbox.activate(0)
+                btn = self._suggest_buttons[0]
+                btn.focus_set()
             except Exception:
                 pass
             return "break"
         return None
 
-    # ---------------- Geocoding thread + cache ----------------
+    # ---------------- Geocode ----------------
     def _schedule_geocode_fetch(self, query: str):
         ql = query.lower()
         cached = self._geocode_cache.get(ql)
@@ -719,7 +771,7 @@ class WeatherApp(ctk.CTk):
         params = {"q": query, "limit": 6, "appid": API_KEY}
         results: List[str] = []
         try:
-            r = requests.get(GEOCODE_URL, params=params, timeout=8)
+            r = self.session.get(GEOCODE_URL, params=params, timeout=8)
             r.raise_for_status()
             data = r.json()
             for item in data:
@@ -743,8 +795,9 @@ class WeatherApp(ctk.CTk):
     def _merge_geocode_suggestions(self, geocode_list: List[str]):
         try:
             existing = []
-            if self._suggest_listbox:
-                existing = [self._suggest_listbox.get(i) for i in range(self._suggest_listbox.size())]
+            # gather existing displayed suggestion texts
+            if self._suggest_buttons:
+                existing = [b.cget("text") for b in self._suggest_buttons]
             merged = []
             seen = set()
             for s in existing + geocode_list:
@@ -753,9 +806,72 @@ class WeatherApp(ctk.CTk):
                     seen.add(k.lower())
                     merged.append(k)
             if merged:
-                self._show_suggestions(merged)
+                self._show_ctk_suggestions(merged)
         except Exception:
             pass
+
+    # ---------------- Auto-detect ----------------
+    def _maybe_auto_detect_location(self):
+        if not self.auto_detect_enabled:
+            return
+        if self._did_auto_detect:
+            return
+        if self._user_searched:
+            return
+        thread = threading.Thread(target=self._detect_location_thread, daemon=True)
+        thread.start()
+
+    def _detect_location_thread(self):
+        try:
+            r = self.session.get(IP_GEO_URL, timeout=6)
+            r.raise_for_status()
+            data = r.json()
+            lat = data.get("lat")
+            lon = data.get("lon")
+            city = data.get("city") or data.get("regionName") or ""
+            if lat is not None and lon is not None:
+                self.after(0, lambda: self._on_location_detected(lat, lon, city))
+        except Exception as e:
+            print("Location detect error:", e)
+
+    def _on_location_detected(self, lat: float, lon: float, city_hint: str):
+        if self._user_searched:
+            return
+        self._did_auto_detect = True
+        self.start_loading()
+        thread = threading.Thread(target=self._fetch_weather_by_coords_thread, args=(lat, lon, city_hint), daemon=True)
+        thread.start()
+
+    def _fetch_weather_by_coords_thread(self, lat: float, lon: float, city_hint: str):
+        units = "metric" if self.temp_unit == "C" else "imperial"
+        params = {"lat": lat, "lon": lon, "appid": API_KEY, "units": units}
+        current_data = None
+        forecast_data = None
+        error = None
+        try:
+            r = self.session.get(WEATHER_URL, params=params, timeout=12)
+            try:
+                current_json = r.json()
+            except Exception:
+                current_json = None
+            if r.status_code != 200:
+                msg = current_json.get("message") if isinstance(current_json, dict) else r.text
+                error = f"HTTP {r.status_code}: {msg}"
+            else:
+                current_data = current_json
+            r2 = self.session.get(FORECAST_URL, params=params, timeout=12)
+            try:
+                forecast_json = r2.json()
+            except Exception:
+                forecast_json = None
+            if r2.status_code != 200:
+                msg = forecast_json.get("message") if isinstance(forecast_json, dict) else r2.text
+                error = error or f"Forecast HTTP {r2.status_code}: {msg}"
+            else:
+                forecast_data = forecast_json
+        except Exception as e:
+            error = str(e)
+        self.after(0, lambda: self.on_fetch_complete(city_hint or "Current location", current_data, forecast_data, error))
 
     # ------------- Networking & UI (search, update) ----------------
     def search_and_update(self):
@@ -763,6 +879,16 @@ class WeatherApp(ctk.CTk):
         if not city:
             return
         if self.is_loading:
+            return
+        key = city.lower()
+        cached = self._search_cache.get(key)
+        if cached and (time.time() - cached[0]) < SEARCH_CACHE_TTL:
+            _, cur, forcast = cached
+            try:
+                self.update_ui_with_data(cur, forcast)
+                threading.Thread(target=lambda: self._fetch_weather_thread(city), daemon=True).start()
+            except Exception:
+                pass
             return
         self._hide_suggestions()
         self.start_loading()
@@ -776,7 +902,7 @@ class WeatherApp(ctk.CTk):
         forecast_data = None
         error = None
         try:
-            r = requests.get(WEATHER_URL, params=params, timeout=12)
+            r = self.session.get(WEATHER_URL, params=params, timeout=12)
             try:
                 current_json = r.json()
             except Exception:
@@ -789,7 +915,7 @@ class WeatherApp(ctk.CTk):
                     error = f"HTTP {r.status_code}: {msg}"
             else:
                 current_data = current_json
-            r2 = requests.get(FORECAST_URL, params=params, timeout=12)
+            r2 = self.session.get(FORECAST_URL, params=params, timeout=12)
             try:
                 forecast_json = r2.json()
             except Exception:
@@ -799,8 +925,6 @@ class WeatherApp(ctk.CTk):
                 error = error or f"Forecast HTTP {r2.status_code}: {msg}"
             else:
                 forecast_data = forecast_json
-        except requests.exceptions.RequestException as e:
-            error = str(e)
         except Exception as e:
             error = str(e)
         self.after(0, lambda: self.on_fetch_complete(city, current_data, forecast_data, error))
@@ -832,6 +956,14 @@ class WeatherApp(ctk.CTk):
         except Exception as e:
             print("Update UI error:", e)
             self.error_label.configure(text="Error displaying weather.")
+        # cache in-memory and persist last weather
+        try:
+            key = (current_data.get("name") or city or "").lower()
+            if key:
+                self._search_cache[key] = (time.time(), current_data, forecast_data)
+            save_last_weather(current_data, forecast_data)
+        except Exception:
+            pass
         # DB logging
         try:
             database.add_recent(current_data.get("name", city), int(round(current_data["main"]["temp"])))
@@ -894,7 +1026,6 @@ class WeatherApp(ctk.CTk):
 
         self.city_label.configure(text=city_name)
         self.chance_label.configure(text=f"Condition: {desc}")
-
         if getattr(self, "temp_unit", "C") == "C":
             self.temp_label.configure(text=f"{int(round(temp))}°C" if temp is not None else "--°C")
         else:
@@ -949,7 +1080,7 @@ class WeatherApp(ctk.CTk):
         except Exception:
             pass
 
-        # hourly and 5-day update
+        # hourly + 5-day (unchanged)
         for widget in self.hourly_container.winfo_children():
             widget.destroy()
         hours = forecast.get("list", [])[:7]
@@ -1021,7 +1152,7 @@ class WeatherApp(ctk.CTk):
             return img
         return None
 
-    # favorites / recents windows, toggle, settings, toast...
+    # favorites/recents etc.
     def open_favorites_window(self):
         try:
             win = ctk.CTkToplevel(self)
@@ -1073,6 +1204,7 @@ class WeatherApp(ctk.CTk):
 
     def search_from_recents(self, city_name: str):
         self.search_var.set(city_name)
+        self._user_searched = True
         self.search_and_update()
 
     def toggle_favorite(self):
@@ -1084,11 +1216,27 @@ class WeatherApp(ctk.CTk):
             if database.is_favorite(city):
                 database.remove_favorite(city)
                 self.favorite_btn.configure(text="☆")
+                self.show_toast("Removed from favorites")
+                # subtle pulse: gray then back
+                self._pulse_fav("#666666", "#444444")
             else:
                 database.add_favorite(city, self._last_temp or 0, self._last_condition or "")
                 self.favorite_btn.configure(text="★")
+                self.show_toast("Added to favorites")
+                self._pulse_fav("#ffcc00", "#444444")
         except Exception as e:
             print("Favorite toggle error:", e)
+
+    def _pulse_fav(self, pulse_color: str, end_color: str, duration_ms: int = 300):
+        try:
+            # change color briefly
+            try:
+                self.favorite_btn.configure(fg_color=pulse_color)
+            except Exception:
+                pass
+            self.after(duration_ms, lambda: self.favorite_btn.configure(fg_color=end_color))
+        except Exception:
+            pass
 
     def show_settings(self):
         try:
@@ -1159,17 +1307,26 @@ class SettingsScreen(ctk.CTkFrame):
         self.app = app
         self.configure(corner_radius=20)
         ctk.CTkLabel(self, text="Settings", font=("Arial", 28, "bold")).pack(pady=30)
+
         self.unit_var = ctk.StringVar(value=self.app.settings.get("unit", "C"))
         unit_frame = ctk.CTkFrame(self, corner_radius=12)
         unit_frame.pack(pady=10, padx=40, fill="x")
         ctk.CTkLabel(unit_frame, text="Temperature Unit").pack(side="left", padx=10)
         ctk.CTkRadioButton(unit_frame, text="°C", variable=self.unit_var, value="C", command=self.set_unit).pack(side="left", padx=10)
         ctk.CTkRadioButton(unit_frame, text="°F", variable=self.unit_var, value="F", command=self.set_unit).pack(side="left", padx=10)
+
         bg_frame = ctk.CTkFrame(self, corner_radius=12)
         bg_frame.pack(pady=10, padx=40, fill="x")
         ctk.CTkLabel(bg_frame, text="Dynamic Background").pack(side="left", padx=10)
         self.bg_var = ctk.BooleanVar(value=self.app.settings.get("dynamic_bg", True))
         ctk.CTkSwitch(bg_frame, text="On / Off", variable=self.bg_var, command=self.toggle_bg).pack(side="right", padx=10)
+
+        ad_frame = ctk.CTkFrame(self, corner_radius=12)
+        ad_frame.pack(pady=10, padx=40, fill="x")
+        ctk.CTkLabel(ad_frame, text="Auto-detect location on startup").pack(side="left", padx=10)
+        self.auto_detect_var = tk.BooleanVar(value=self.app.auto_detect_enabled)
+        ctk.CTkSwitch(ad_frame, text="", variable=self.auto_detect_var, command=self.toggle_auto_detect).pack(side="right", padx=10)
+
         clear_frame = ctk.CTkFrame(self, corner_radius=12)
         clear_frame.pack(pady=20, padx=40, fill="x")
         ctk.CTkButton(clear_frame, text="Clear Recents", command=self.clear_recents).pack(pady=10, fill="x")
@@ -1195,6 +1352,15 @@ class SettingsScreen(ctk.CTkFrame):
         except Exception:
             pass
 
+    def toggle_auto_detect(self):
+        val = bool(self.auto_detect_var.get())
+        self.app.auto_detect_enabled = val
+        save_autodetect_setting(val)
+        try:
+            self.app.show_toast("Auto-detect setting updated")
+        except Exception:
+            pass
+
     def clear_recents(self):
         database.clear_recents()
 
@@ -1203,7 +1369,7 @@ class SettingsScreen(ctk.CTkFrame):
             database.remove_favorite(city)
 
 
-# ----------------- LoginScreen and RegisterScreen used in flows -----------------
+# ----------------- LoginScreen & RegisterScreen -----------------
 
 class LoginScreen(ctk.CTkFrame):
     def __init__(self, parent, app):
@@ -1302,4 +1468,3 @@ class RegisterScreen(ctk.CTkFrame):
 if __name__ == "__main__":
     app = WeatherApp()
     app.mainloop()
-
