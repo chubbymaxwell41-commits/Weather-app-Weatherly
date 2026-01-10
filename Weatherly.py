@@ -32,7 +32,7 @@ import database  # local module; ensure database.py is in same folder
 
 # ---------- CONFIG ----------
 load_dotenv()
-API_KEY = os.getenv("OWM_API_KEY", "eac408cbe256621670200c5d87db8ac4")
+API_KEY = os.getenv("OWM_API_KEY", "YOUR_API_KEY_HERE")
 WEATHER_URL = "https://api.openweathermap.org/data/2.5/weather"
 FORECAST_URL = "https://api.openweathermap.org/data/2.5/forecast"
 GEOCODE_URL = "http://api.openweathermap.org/geo/1.0/direct"
@@ -1302,3 +1302,4 @@ class RegisterScreen(ctk.CTkFrame):
 if __name__ == "__main__":
     app = WeatherApp()
     app.mainloop()
+
