@@ -71,7 +71,7 @@ Admin users can view logs and user activity
 Admin Login: admin, password: admin123
 
 1️⃣ Clone the repository
-git clone https://github.com/chubbymaxwell41-commits/Weather-app-Weatherly.git
+git clone https://github.com/LynxCodez/Weather-app-Weatherly.git
 
 2️⃣ Install dependencies
 pip install requests
